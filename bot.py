@@ -1,5 +1,6 @@
 # =========================================================
-# FUTURES SIGNAL BOT
+# FUTURES SIGNAL BOT — Interactive Menu Version
+# On-demand scanning with all 70 factors
 # =========================================================
 
 import asyncio
@@ -11,38 +12,38 @@ from datetime import datetime, timezone, timedelta
 import numpy as np
 import pandas as pd
 import requests
+from aiohttp import web
 from binance import AsyncClient
 from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator, MACD, ADXIndicator
 from ta.volatility import AverageTrueRange, BollingerBands
 from ta.volume import VolumeWeightedAveragePrice, OnBalanceVolumeIndicator
-from telegram import Bot
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
+# =========================================================
+# CONFIG
+# =========================================================
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 BINANCE_API_KEY    = os.environ.get("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.environ.get("BINANCE_API_SECRET")
 CRYPTOPANIC_API_KEY = os.environ.get("CRYPTOPANIC_API_KEY", "")
 
-SCAN_TOP10 = True
-TOP_GAINERS = 20
-TOP_LOSERS = 20
 MIN_VOLUME_USD = 10_000_000
-SCAN_INTERVAL = 3600
-
 ACCOUNT_BALANCE = 100.0
 RISK_PER_TRADE = 0.01
 MIN_RR = 2.0
 LEVERAGE = 5
-MAX_DAILY_LOSS = 0.03
 MIN_SCORE = 30
-
 BATCH_SIZE = 10
-BATCH_DELAY = 3
+BATCH_DELAY = 2
+PORT = int(os.environ.get("PORT", 10000))
 
-daily_loss = 0.0
-last_reset = datetime.now(timezone.utc).date()
-active_signals = {}
+# =========================================================
+# GLOBAL CLIENT
+# =========================================================
+binance_client = None
 
 def body(c): return abs(c["close"] - c["open"])
 def rng(c):  return c["high"] - c["low"]
@@ -51,10 +52,7 @@ def lower_wick(c): return min(c["open"], c["close"]) - c["low"]
 def is_bull(c): return c["close"] > c["open"]
 def is_bear(c): return c["close"] < c["open"]
 def mid(c): return (c["open"] + c["close"]) / 2
-
-def escape(txt):
-    return str(txt).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-  # =========================================================
+    # =========================================================
 # DATA FETCH
 # =========================================================
 async def fetch_klines(client, symbol, interval, limit=250):
@@ -68,7 +66,8 @@ async def fetch_klines(client, symbol, interval, limit=250):
             df[c] = df[c].astype(float)
         df["time"] = pd.to_datetime(df["time"], unit="ms")
         return df
-    except Exception:
+    except Exception as e:
+        print(f"Klines error {symbol} {interval}: {e}")
         return None
 
 async def fetch_oi(client, symbol):
@@ -138,7 +137,7 @@ def fetch_news(symbol, hours=2):
         return {"has_news": len(items) > 0, "count": len(items)}
     except Exception:
         return {"has_news": False, "count": 0}
-      # =========================================================
+# =========================================================
 # INDICATORS
 # =========================================================
 def add_indicators(df):
@@ -156,7 +155,10 @@ def add_indicators(df):
     df["bb_lower"] = bb.bollinger_lband()
     df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / df["close"]
     df["bb_squeeze"] = df["bb_width"] < df["bb_width"].rolling(50).quantile(0.2)
-    df["adx"] = ADXIndicator(df["high"], df["low"], df["close"], 14).adx()
+    try:
+        df["adx"] = ADXIndicator(df["high"], df["low"], df["close"], 14).adx()
+    except Exception:
+        df["adx"] = 20.0
     try:
         df["vwap"] = VolumeWeightedAveragePrice(
             high=df["high"], low=df["low"], close=df["close"],
@@ -170,6 +172,8 @@ def add_indicators(df):
 # TREND & STRUCTURE
 # =========================================================
 def get_trend(df):
+    if df is None or len(df) < 200:
+        return "UNKNOWN"
     last = df.iloc[-1]
     if last["ema50"] > last["ema200"] and last["close"] > last["ema50"]:
         return "BULLISH"
@@ -178,6 +182,8 @@ def get_trend(df):
     return "RANGING"
 
 def get_structure(df):
+    if df is None or len(df) < 20:
+        return "UNCLEAR"
     highs = df["high"].rolling(5, center=True).max()
     lows  = df["low"].rolling(5, center=True).min()
     sh = df["high"][df["high"] == highs].tail(3).tolist()
@@ -192,6 +198,8 @@ def get_structure(df):
     return "UNCLEAR"
 
 def detect_bos_choch(df, lookback=30):
+    if df is None or len(df) < 15:
+        return {"bos": None, "choch": None}
     data = df.tail(lookback)
     if len(data) < 10:
         return {"bos": None, "choch": None}
@@ -215,26 +223,36 @@ def detect_bos_choch(df, lookback=30):
     return {"bos": bos, "choch": choch}
 
 def get_key_levels(df_daily):
+    if df_daily is None or len(df_daily) < 2:
+        return {"pdh": None, "pdl": None}
     prev = df_daily.iloc[-2]
     return {"pdh": prev["high"], "pdl": prev["low"]}
 
 def near_key_level(price, levels, tol=0.003):
     for name, lvl in levels.items():
+        if lvl is None:
+            continue
         if abs(price - lvl) / lvl < tol:
             return name
     return None
-  # =========================================================
+    # =========================================================
 # LIQUIDITY / ZONES
 # =========================================================
 def check_liquidity_sweep(df, levels):
+    if df is None or len(df) < 2:
+        return None
     last = df.iloc[-1]
-    if last["low"] < levels["pdl"] and last["close"] > levels["pdl"]:
+    pdl = levels.get("pdl")
+    pdh = levels.get("pdh")
+    if pdl and last["low"] < pdl and last["close"] > pdl:
         return "BULLISH_SWEEP"
-    if last["high"] > levels["pdh"] and last["close"] < levels["pdh"]:
+    if pdh and last["high"] > pdh and last["close"] < pdh:
         return "BEARISH_SWEEP"
     return None
 
 def detect_supply_demand(df, lookback=100):
+    if df is None or len(df) < 5:
+        return {"demand": [], "supply": []}
     data = df.tail(lookback).reset_index(drop=True)
     demand, supply = [], []
     for i in range(2, len(data) - 1):
@@ -255,8 +273,10 @@ def price_in_zone(price, zones, tol=0.002):
     return False
 
 def detect_fvg(df):
+    if df is None or len(df) < 5:
+        return []
     fvgs = []
-    for i in range(2, len(df)):
+    for i in range(2, min(len(df), 50)):
         c1 = df.iloc[i-2]
         c3 = df.iloc[i]
         if c3["low"] > c1["high"]:
@@ -266,6 +286,8 @@ def detect_fvg(df):
     return fvgs[-3:]
 
 def premium_discount(df, lookback=100):
+    if df is None or len(df) < 10:
+        return "EQUILIBRIUM"
     high = df["high"].tail(lookback).max()
     low  = df["low"].tail(lookback).min()
     midp = (high + low) / 2
@@ -275,9 +297,9 @@ def premium_discount(df, lookback=100):
     return "EQUILIBRIUM"
 
 def volume_profile(df, bins=50, lookback=200):
-    data = df.tail(lookback)
-    if len(data) < 20:
+    if df is None or len(df) < 20:
         return {"hvn": [], "lvn": [], "poc": None}
+    data = df.tail(lookback)
     pmin, pmax = data["low"].min(), data["high"].max()
     if pmax == pmin:
         return {"hvn": [], "lvn": [], "poc": None}
@@ -298,6 +320,8 @@ def volume_profile(df, bins=50, lookback=200):
     return {"hvn": hvn, "lvn": lvn, "poc": poc}
 
 def find_divergence(df, ind="rsi", lookback=40):
+    if df is None or len(df) < 15:
+        return None
     data = df.tail(lookback).reset_index(drop=True)
     if len(data) < 15:
         return None
@@ -314,8 +338,8 @@ def find_divergence(df, ind="rsi", lookback=40):
         if data.loc[p2, "high"] > data.loc[p1, "high"] and data.loc[p2, ind] < data.loc[p1, ind]:
             return "BEARISH_DIVERGENCE"
     return None
-  # =========================================================
-# CANDLESTICK PATTERNS
+    # =========================================================
+# CANDLESTICK PATTERNS (39 patterns)
 # =========================================================
 def is_doji(c): return body(c) <= rng(c) * 0.1
 def is_dragonfly(c): return is_doji(c) and lower_wick(c) > rng(c) * 0.6 and upper_wick(c) < rng(c) * 0.1
@@ -369,8 +393,9 @@ def is_three_outside_down(c1, c2, c3):
     return is_bear_engulf(c1, c2) and is_bear(c3) and c3["close"] < c2["close"]
 
 def detect_patterns(df):
-    if len(df) < 5: return []
-    c1, c2, c3, c4, c5 = [df.iloc[-5], df.iloc[-4], df.iloc[-3], df.iloc[-2], df.iloc[-1]]
+    if df is None or len(df) < 5:
+        return []
+    c1 = df.iloc[-5]; c2 = df.iloc[-4]; c3 = df.iloc[-3]; c4 = df.iloc[-2]; c5 = df.iloc[-1]
     p = []
     if is_doji(c5): p.append("DOJI")
     if is_dragonfly(c5): p.append("DRAGONFLY_DOJI")
@@ -407,11 +432,10 @@ BEARISH = {"SHOOTING_STAR","BEARISH_ENGULFING","DARK_CLOUD_COVER","BEARISH_HARAM
            "TWEEZER_TOP","EVENING_STAR","THREE_BLACK_CROWS","THREE_INSIDE_DOWN",
            "THREE_OUTSIDE_DOWN","BEARISH_MARUBOZU","GRAVESTONE_DOJI"}
 # =========================================================
-# SCORING ENGINE (70 FACTORS)
+# SCORING (70 FACTORS)
 # =========================================================
 def compute_score(s):
     score = 0
-    # TREND & STRUCTURE (12)
     if s["trend_4h"] in ("BULLISH","BEARISH"): score += 2
     if s["trend_1h"] in ("BULLISH","BEARISH"): score += 2
     if s["trend_1d"] in ("BULLISH","BEARISH"): score += 1
@@ -420,12 +444,10 @@ def compute_score(s):
     if s["bos_choch"]["bos"]: score += 2
     if s["bos_choch"]["choch"]: score += 1
     if s["key_level"]: score += 2
-    # LIQUIDITY (10)
     if s["sweep"]: score += 3
     if s["zones"]["demand"] or s["zones"]["supply"]: score += 2
     if s["fvg"]: score += 1
     if s["pd_zone"] in ("PREMIUM","DISCOUNT"): score += 1
-    # VOLUME & DERIVATIVES (12)
     if s["volume"]: score += 3
     if s["near_hvn"]: score += 1
     if s["near_lvn"]: score += 1
@@ -435,7 +457,6 @@ def compute_score(s):
     if s["taker"]: score += 1
     if s["basis"]: score += 1
     if s["liq"] and (s["liq"]["long_liq"] > 0 or s["liq"]["short_liq"] > 0): score += 1
-    # INDICATORS (16)
     if s["vwap_ok"]: score += 1
     if s["rsi_ok"]: score += 1
     if s["macd_ok"]: score += 1
@@ -443,19 +464,14 @@ def compute_score(s):
     if s["divergence"]: score += 2
     if s["atr"]: score += 1
     if s["bb_squeeze"]: score += 1
-    # PATTERNS (10)
     if s["patterns_bull"]: score += 3
     if s["patterns_bear"]: score += 3
     if len(s["patterns_bull"] + s["patterns_bear"]) >= 2: score += 2
-    # NEWS + SESSION (4)
     if s["news_ok"]: score += 2
     if s["session"] in ("LONDON","NY"): score += 1
     if s["kill_zone"]: score += 1
-    # RISK (6)
     if s["rr"] >= MIN_RR: score += 3
     if s["sl_dist"] > 0: score += 1
-    if s["daily_loss_ok"]: score += 1
-    if s["fresh"]: score += 1
     return score
 
 def get_session():
@@ -467,11 +483,6 @@ def get_session():
 
 def is_kill_zone():
     return datetime.now(timezone.utc).hour in (7, 8, 13, 14, 15)
-
-def is_fresh(df, max_age=180):
-    last = df["time"].iloc[-1]
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
-    return (now - last).total_seconds() < max_age
 
 # =========================================================
 # MASTER ANALYZER
@@ -485,7 +496,8 @@ async def analyze_symbol(client, symbol):
         df_1d  = await fetch_klines(client, symbol, "1d", 5)
         if any(x is None for x in [df_4h, df_1h, df_15m, df_5m, df_1d]):
             return None
-    except Exception:
+    except Exception as e:
+        print(f"analyze_symbol error {symbol}: {e}")
         return None
 
     trend_4h = get_trend(df_4h)
@@ -521,7 +533,6 @@ async def analyze_symbol(client, symbol):
     basis = await fetch_basis(client, symbol)
     liq = await fetch_liquidations(client, symbol)
     news = fetch_news(symbol)
-    news_ok = not news["has_news"]
 
     rsi = df_15m.iloc[-1]["rsi"]
     macd_now = df_15m.iloc[-1]["macd"]
@@ -538,66 +549,49 @@ async def analyze_symbol(client, symbol):
     div = find_divergence(df_15m, "rsi")
 
     base = {
-        "symbol": symbol,
-        "price": price,
+        "symbol": symbol, "price": price,
         "trend_4h": trend_4h, "trend_1h": trend_1h,
         "trend_5m": trend_5m, "trend_1d": trend_1d,
-        "structure": structure,
-        "bos_choch": bos_choch,
-        "key_level": key_level,
-        "sweep": sweep,
-        "zones": zones_hit,
-        "fvg": fvg_ok,
-        "pd_zone": pd_zone,
-        "volume": vol_ok,
-        "near_hvn": near_hvn, "near_lvn": near_lvn,
-        "oi": oi, "funding": funding,
-        "ls_ratio": ls_ratio, "taker": taker,
-        "basis": basis, "liq": liq,
-        "news_ok": news_ok,
+        "structure": structure, "bos_choch": bos_choch,
+        "key_level": key_level, "sweep": sweep,
+        "zones": zones_hit, "fvg": fvg_ok, "pd_zone": pd_zone,
+        "volume": vol_ok, "near_hvn": near_hvn, "near_lvn": near_lvn,
+        "oi": oi, "funding": funding, "ls_ratio": ls_ratio,
+        "taker": taker, "basis": basis, "liq": liq,
+        "news_ok": not news["has_news"],
         "rsi": round(rsi, 2), "adx": round(adx, 2),
         "atr": round(atr, 4), "vwap": round(vwap, 4),
         "patterns_bull": bull_p, "patterns_bear": bear_p,
-        "divergence": div,
-        "session": get_session(),
+        "divergence": div, "session": get_session(),
         "kill_zone": is_kill_zone(),
-        "fresh": is_fresh(df_15m),
-        "daily_loss_ok": daily_loss < MAX_DAILY_LOSS,
     }
 
-    # LONG
     long_ok = (
         trend_4h == "BULLISH" and trend_1h == "BULLISH" and
         structure == "HH_HL" and
         sweep == "BULLISH_SWEEP" and
         (zones_hit["demand"] or fvg_ok or pd_zone == "DISCOUNT") and
         bull_p and vol_ok and rsi < 65 and macd_now > macd_sig and
-        adx > 20 and news_ok and daily_loss < MAX_DAILY_LOSS and
-        price > vwap
+        adx > 20 and base["news_ok"] and price > vwap
     )
 
-    # SHORT
     short_ok = (
         trend_4h == "BEARISH" and trend_1h == "BEARISH" and
         structure == "LH_LL" and
         sweep == "BEARISH_SWEEP" and
         (zones_hit["supply"] or fvg_ok or pd_zone == "PREMIUM") and
         bear_p and vol_ok and rsi > 35 and macd_now < macd_sig and
-        adx > 20 and news_ok and daily_loss < MAX_DAILY_LOSS and
-        price < vwap
+        adx > 20 and base["news_ok"] and price < vwap
     )
 
     if long_ok:
         entry = price
         sl = min(df_15m["low"].tail(10)) - atr * 0.5
         risk = entry - sl
-        tp1 = entry + risk
-        tp2 = entry + risk * 2
-        tp3 = entry + risk * 3
         base.update({
             "side": "LONG", "entry": entry, "sl": sl,
-            "tp1": tp1, "tp2": tp2, "tp3": tp3,
-            "sl_dist": risk, "rr": (tp2 - entry) / risk if risk > 0 else 0,
+            "tp1": entry + risk, "tp2": entry + risk * 2, "tp3": entry + risk * 3,
+            "sl_dist": risk, "rr": (entry + risk * 2 - entry) / risk if risk > 0 else 0,
             "rsi_ok": rsi < 65, "macd_ok": True, "adx_ok": adx > 20,
             "vwap_ok": True, "bb_squeeze": df_15m.iloc[-1]["bb_squeeze"],
         })
@@ -608,13 +602,10 @@ async def analyze_symbol(client, symbol):
         entry = price
         sl = max(df_15m["high"].tail(10)) + atr * 0.5
         risk = sl - entry
-        tp1 = entry - risk
-        tp2 = entry - risk * 2
-        tp3 = entry - risk * 3
         base.update({
             "side": "SHORT", "entry": entry, "sl": sl,
-            "tp1": tp1, "tp2": tp2, "tp3": tp3,
-            "sl_dist": risk, "rr": (entry - tp2) / risk if risk > 0 else 0,
+            "tp1": entry - risk, "tp2": entry - risk * 2, "tp3": entry - risk * 3,
+            "sl_dist": risk, "rr": (entry - (entry - risk * 2)) / risk if risk > 0 else 0,
             "rsi_ok": rsi > 35, "macd_ok": True, "adx_ok": adx > 20,
             "vwap_ok": True, "bb_squeeze": df_15m.iloc[-1]["bb_squeeze"],
         })
@@ -622,8 +613,8 @@ async def analyze_symbol(client, symbol):
         return base
 
     return None
-  # =========================================================
-# SCANNER
+    # =========================================================
+# SCANNER FUNCTIONS
 # =========================================================
 async def get_top10(client):
     tickers = await client.futures_ticker()
@@ -632,7 +623,7 @@ async def get_top10(client):
     perps.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
     return [t["symbol"] for t in perps[:10]]
 
-async def get_gainers_losers(client):
+async def get_gainers(client, n=20):
     tickers = await client.futures_ticker()
     clean = []
     for t in tickers:
@@ -646,36 +637,90 @@ async def get_gainers_losers(client):
             clean.append({"symbol": s, "pct": pct})
         except: continue
     clean.sort(key=lambda x: x["pct"], reverse=True)
-    gainers = [c["symbol"] for c in clean[:TOP_GAINERS]]
-    losers  = [c["symbol"] for c in clean[-TOP_LOSERS:]][::-1]
-    return gainers, losers
+    return [c["symbol"] for c in clean[:n]]
 
-async def build_scan_list(client):
-    top10 = await get_top10(client)
-    gainers, losers = await get_gainers_losers(client)
+async def get_losers(client, n=20):
+    tickers = await client.futures_ticker()
+    clean = []
+    for t in tickers:
+        s = t["symbol"]
+        if not s.endswith("USDT"): continue
+        if any(x in s for x in ["_","UP","DOWN","BULL","BEAR"]): continue
+        try:
+            vol = float(t["quoteVolume"])
+            pct = float(t["priceChangePercent"])
+            if vol < MIN_VOLUME_USD: continue
+            clean.append({"symbol": s, "pct": pct})
+        except: continue
+    clean.sort(key=lambda x: x["pct"])
+    return [c["symbol"] for c in clean[:n]]
+
+async def get_all_coins(client):
+    top = await get_top10(client)
+    gainers = await get_gainers(client, 20)
+    losers = await get_losers(client, 20)
     seen = set(); final = []
-    for s in top10 + gainers + losers:
+    for s in top + gainers + losers:
         if s not in seen:
             seen.add(s); final.append(s)
     return final
 
 # =========================================================
-# TELEGRAM MESSAGE
+# SCAN WITH PROGRESS
 # =========================================================
-def fmt(s):
+async def run_scan(client, symbols, update_msg, label="Scanning"):
+    start = time.time()
+    best = None
+    total = len(symbols)
+
+    for i, sym in enumerate(symbols):
+        elapsed = int(time.time() - start)
+        if i > 0:
+            remaining = int((elapsed / i) * (total - i))
+        else:
+            remaining = 0
+
+        if i % 2 == 0:
+            pct = i * 10 // max(total, 1)
+            bar = "█" * pct + "░" * (10 - pct)
+            best_txt = f"Best: {best['score']}/70 ({best['symbol']})" if best else "Best: searching..."
+            text = (
+                f"🎯 <b>{label}</b>\n\n"
+                f"Progress: [{bar}] {i}/{total}\n"
+                f"Current: {sym}\n"
+                f"Elapsed: {elapsed}s\n"
+                f"Est. left: ~{remaining}s\n"
+                f"{best_txt}"
+            )
+            try:
+                await update_msg.edit_text(text, parse_mode="HTML")
+            except Exception:
+                pass
+
+        result = await analyze_symbol(client, sym)
+        if result and result.get("score", 0) > (best["score"] if best else 0):
+            best = result
+
+        await asyncio.sleep(0.2)
+
+    return best, int(time.time() - start)
+
+# =========================================================
+# MESSAGE FORMAT
+# =========================================================
+def fmt_signal(s):
     emoji = "🟢" if s["side"] == "LONG" else "🔴"
     return f"""
 {emoji} <b>{s['symbol']} — {s['side']}</b>
+🎯 Score: <b>{s['score']}/70</b>
 
 📊 <b>CONTEXT</b>
 • 4H Trend: {s['trend_4h']}
 • 1H Trend: {s['trend_1h']}
 • Structure: {s['structure']}
-• BOS/CHOCH: {s['bos_choch']['bos'] or '-'} / {s['bos_choch']['choch'] or '-'}
-• Key Level: {s['key_level'] or '-'}
+• BOS: {s['bos_choch']['bos'] or '-'}
 • Sweep: {s['sweep'] or '-'}
 • Zone: {s['pd_zone']}
-• Session: {s['session']} {'🔥' if s['kill_zone'] else ''}
 
 🕯️ <b>PATTERNS</b>
 • Bull: {', '.join(s['patterns_bull']) or '-'}
@@ -683,84 +728,222 @@ def fmt(s):
 • Divergence: {s['divergence'] or '-'}
 
 📈 <b>INDICATORS</b>
-• RSI: {s['rsi']}
-• ADX: {s['adx']}
-• ATR: {s['atr']}
-• VWAP: {s['vwap']}
+• RSI: {s['rsi']} | ADX: {s['adx']}
+• ATR: {s['atr']} | VWAP: {s['vwap']}
 • Volume: {'✅' if s['volume'] else '❌'}
 
 💰 <b>TRADE PLAN</b>
 • Entry: {round(s['entry'],4)}
 • Stop-Loss: {round(s['sl'],4)}
-• TP1: {round(s['tp1'],4)}  (50%, SL→BE)
-• TP2: {round(s['tp2'],4)}  (30%, trail)
-• TP3: {round(s['tp3'],4)}  (20%)
+• TP1: {round(s['tp1'],4)} (50%, SL→BE)
+• TP2: {round(s['tp2'],4)} (30%, trail)
+• TP3: {round(s['tp3'],4)} (20%)
 
 ⚖️ R:R = 1:{round(s['rr'],2)}
-🎯 Score: {s['score']}/70
-
-⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC
+⏰ {datetime.now(timezone.utc).strftime('%H:%M')} UTC
 """
 
-def log_journal(s):
-    fields = ["symbol","side","entry","sl","tp1","tp2","tp3","score","rsi","adx","atr","rr"]
-    exists = os.path.isfile("journal.csv")
-    with open("journal.csv","a",newline="") as f:
-        w = csv.writer(f)
-        if not exists: w.writerow(fields)
-        w.writerow([s.get(k,"") for k in fields])
+def fmt_no_signal(label, scanned, duration, best):
+    best_txt = f"Best score: {best['score']}/70 ({best['symbol']})" if best else "No score info"
+    return (
+        f"🎯 <b>{label} Complete</b>\n\n"
+        f"Scanned: {scanned} coins\n"
+        f"Duration: {duration}s\n"
+        f"{best_txt}\n\n"
+        f"❌ No valid setup (below min score {MIN_SCORE})"
+    )
 
 # =========================================================
-# MAIN LOOP
+# TELEGRAM MENU
+# =========================================================
+def main_menu():
+    kb = [
+        [InlineKeyboardButton("⚡ Quick Signal (5)", callback_data="quick"),
+         InlineKeyboardButton("🎯 Deep Analysis (50)", callback_data="deep")],
+        [InlineKeyboardButton("📊 Top 10 Coins", callback_data="top10"),
+         InlineKeyboardButton("📈 Top 20 Gainers", callback_data="gainers")],
+        [InlineKeyboardButton("📉 Top 20 Losers", callback_data="losers"),
+         InlineKeyboardButton("🔍 Scan Single Coin", callback_data="single")],
+        [InlineKeyboardButton("📋 Help", callback_data="help")],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 <b>Futures Signal Bot</b>\n\n"
+        "Choose what to scan:",
+        reply_markup=main_menu(),
+        parse_mode="HTML"
+    )
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+    msg = q.message
+
+    global binance_client
+    if binance_client is None:
+        binance_client = await AsyncClient.create(BINANCE_API_KEY, BINANCE_API_SECRET)
+
+    try:
+        if data == "quick":
+            await q.edit_message_text("⚡ Quick scan starting...")
+            syms = (await get_top10(binance_client))[:5]
+            best, dur = await run_scan(binance_client, syms, msg, "Quick Scan (5 coins)")
+            if best and best["score"] >= MIN_SCORE:
+                await q.edit_message_text(fmt_signal(best), parse_mode="HTML",
+                                          reply_markup=main_menu())
+            else:
+                await q.edit_message_text(
+                    fmt_no_signal("Quick Scan", len(syms), dur, best),
+                    parse_mode="HTML", reply_markup=main_menu())
+
+        elif data == "deep":
+            await q.edit_message_text("🎯 Deep analysis starting (may take 3-5 min)...")
+            syms = await get_all_coins(binance_client)
+            best, dur = await run_scan(binance_client, syms, msg, "Deep Analysis")
+            if best and best["score"] >= MIN_SCORE:
+                await q.edit_message_text(fmt_signal(best), parse_mode="HTML",
+                                          reply_markup=main_menu())
+            else:
+                await q.edit_message_text(
+                    fmt_no_signal("Deep Analysis", len(syms), dur, best),
+                    parse_mode="HTML", reply_markup=main_menu())
+
+        elif data == "top10":
+            await q.edit_message_text("📊 Scanning Top 10...")
+            syms = await get_top10(binance_client)
+            best, dur = await run_scan(binance_client, syms, msg, "Top 10 Scan")
+            if best and best["score"] >= MIN_SCORE:
+                await q.edit_message_text(fmt_signal(best), parse_mode="HTML",
+                                          reply_markup=main_menu())
+            else:
+                await q.edit_message_text(
+                    fmt_no_signal("Top 10 Scan", len(syms), dur, best),
+                    parse_mode="HTML", reply_markup=main_menu())
+
+        elif data == "gainers":
+            await q.edit_message_text("📈 Scanning Top 20 Gainers...")
+            syms = await get_gainers(binance_client, 20)
+            best, dur = await run_scan(binance_client, syms, msg, "Top Gainers Scan")
+            if best and best["score"] >= MIN_SCORE:
+                await q.edit_message_text(fmt_signal(best), parse_mode="HTML",
+                                          reply_markup=main_menu())
+            else:
+                await q.edit_message_text(
+                    fmt_no_signal("Gainers Scan", len(syms), dur, best),
+                    parse_mode="HTML", reply_markup=main_menu())
+
+        elif data == "losers":
+            await q.edit_message_text("📉 Scanning Top 20 Losers...")
+            syms = await get_losers(binance_client, 20)
+            best, dur = await run_scan(binance_client, syms, msg, "Top Losers Scan")
+            if best and best["score"] >= MIN_SCORE:
+                await q.edit_message_text(fmt_signal(best), parse_mode="HTML",
+                                          reply_markup=main_menu())
+            else:
+                await q.edit_message_text(
+                    fmt_no_signal("Losers Scan", len(syms), dur, best),
+                    parse_mode="HTML", reply_markup=main_menu())
+
+        elif data == "single":
+            await q.edit_message_text(
+                "🔍 Send me a symbol:\n\nExample: <code>BTCUSDT</code>",
+                parse_mode="HTML"
+            )
+
+        elif data == "help":
+            await q.edit_message_text(
+                "📖 <b>How to use</b>\n\n"
+                "• ⚡ Quick: Top 5 coins, fast\n"
+                "• 🎯 Deep: All ~50 coins, full analysis\n"
+                "• 📊 Top 10: By volume\n"
+                "• 📈 Gainers / 📉 Losers: By 24h %\n"
+                "• 🔍 Single: Type any symbol\n\n"
+                f"Min score to signal: {MIN_SCORE}/70",
+                parse_mode="HTML", reply_markup=main_menu())
+
+    except Exception as e:
+        print(f"Button error: {e}")
+        try:
+            await q.edit_message_text(
+                f"⚠️ Error: {str(e)[:100]}",
+                reply_markup=main_menu()
+            )
+        except Exception:
+            pass
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global binance_client
+    sym = update.message.text.strip().upper()
+    if not sym.endswith("USDT"):
+        sym = sym + "USDT"
+
+    if binance_client is None:
+        binance_client = await AsyncClient.create(BINANCE_API_KEY, BINANCE_API_SECRET)
+
+    msg = await update.message.reply_text(f"🔍 Scanning {sym}...")
+    try:
+        result = await analyze_symbol(binance_client, sym)
+        if result and result["score"] >= MIN_SCORE:
+            await msg.edit_text(fmt_signal(result), parse_mode="HTML",
+                                reply_markup=main_menu())
+        else:
+            score = result["score"] if result else 0
+            await msg.edit_text(
+                f"🔍 <b>{sym}</b>\n\nScore: {score}/70\n❌ Below min score {MIN_SCORE}",
+                parse_mode="HTML", reply_markup=main_menu())
+    except Exception as e:
+        await msg.edit_text(f"⚠️ Error scanning {sym}: {str(e)[:100]}",
+                            reply_markup=main_menu())
+        # =========================================================
+# ANTI-SLEEP WEB SERVER
+# =========================================================
+async def health(request):
+    return web.Response(text="OK")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    print(f"✅ Health server running on port {PORT}")
+
+# =========================================================
+# MAIN RUNNER
 # =========================================================
 async def main():
-    global daily_loss, last_reset
-    client = await AsyncClient.create(BINANCE_API_KEY, BINANCE_API_SECRET)
-    bot = Bot(token=TELEGRAM_TOKEN)
-    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚀 Bot LIVE — scanning hourly.")
-    print("Bot started")
+    global binance_client
+    binance_client = await AsyncClient.create(BINANCE_API_KEY, BINANCE_API_SECRET)
 
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+
+    await start_web_server()
+
+    print("🤖 Bot started — interactive mode")
+    try:
+        await app.bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text="🤖 <b>Bot is LIVE</b>\n\nSend /start to open the menu.",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        print(f"Startup message error: {e}")
+
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+
+    # Keep running forever
     while True:
-        cycle_start = time.time()
-        today = datetime.now(timezone.utc).date()
-        if today != last_reset:
-            daily_loss = 0.0; last_reset = today
-
-        try:
-            scan = await build_scan_list(client)
-            print(f"Scanning {len(scan)} coins")
-            signals = []
-
-            for i in range(0, len(scan), BATCH_SIZE):
-                batch = scan[i:i+BATCH_SIZE]
-                tasks = [analyze_symbol(client, sym) for sym in batch]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                for r in results:
-                    if isinstance(r, dict) and r.get("score",0) >= MIN_SCORE:
-                        signals.append(r)
-                await asyncio.sleep(BATCH_DELAY)
-
-            if signals:
-                signals.sort(key=lambda x: x["score"], reverse=True)
-                for sig in signals[:1]:
-                    key = f"{sig['symbol']}_{sig['side']}_{round(sig['entry'],2)}"
-                    if key in active_signals: continue
-                    active_signals[key] = True
-                    await bot.send_message(chat_id=TELEGRAM_CHAT_ID,
-                                           text=fmt(sig), parse_mode="HTML")
-                    log_journal(sig)
-                    print(f"✅ {sig['symbol']} {sig['side']} score={sig['score']}")
-            else:
-                print("No signals this cycle")
-
-        except Exception as e:
-            print(f"Cycle error: {e}")
-
-        elapsed = time.time() - cycle_start
-        sleep_t = max(0, SCAN_INTERVAL - elapsed)
-        print(f"Sleeping {sleep_t:.0f}s")
-        await asyncio.sleep(sleep_t)
+        await asyncio.sleep(3600)
 
 if __name__ == "__main__":
     asyncio.run(main())
-  
