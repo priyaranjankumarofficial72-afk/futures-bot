@@ -4,3 +4,4 @@ python-telegram-bot
 python-binance
 ta
 requests
+aiohttp
