@@ -1,5 +1,6 @@
 # =========================================================
 # FUTURES SIGNAL BOT — Bybit Data (30 Factors + 15 Patterns)
+# Interactive Menu + Auto Scan every 30 min
 # =========================================================
 
 import asyncio
@@ -30,6 +31,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 MIN_VOLUME_USD = 10_000_000
 MIN_SCORE = 20
 PORT = int(os.environ.get("PORT", 10000))
+AUTO_SCAN_MINUTES = 30
 
 bybit = HTTP(testnet=False)
 
@@ -265,7 +267,6 @@ BEARISH_P = {"SHOOTING_STAR","BEARISH_ENGULFING","DARK_CLOUD_COVER",
 # =========================================================
 def compute_score(s):
     score = 0
-    # Trend & Structure (up to 11)
     if s["trend_4h"] in ("BULLISH","BEARISH"): score += 2
     if s["trend_1h"] in ("BULLISH","BEARISH"): score += 2
     if s["trend_1d"] in ("BULLISH","BEARISH"): score += 1
@@ -273,27 +274,22 @@ def compute_score(s):
     if s["structure"] in ("HH_HL","LH_LL"): score += 2
     if s["bos_choch"]["bos"]: score += 2
     if s["bos_choch"]["choch"]: score += 1
-    # Levels & Liquidity (up to 7)
     if s["key_level"]: score += 2
     if s["sweep"]: score += 3
     if s["pdh_pdl_near"]: score += 2
-    # Volume & Momentum (up to 7)
     if s["volume"]: score += 2
     if s["ema20_ok"]: score += 1
     if s["ema50_ok"]: score += 1
     if s["ema200_ok"]: score += 1
     if s["rsi_ok"]: score += 1
     if s["macd_ok"]: score += 1
-    # Volatility (up to 4)
     if s["atr_ok"]: score += 1
     if s["bb_ok"]: score += 1
     if s["bb_squeeze"]: score += 1
     if s["adx_ok"]: score += 1
-    # Patterns (up to 7)
     if s["patterns_bull"]: score += 3
     if s["patterns_bear"]: score += 3
     if len(s["patterns_bull"] + s["patterns_bear"]) >= 2: score += 1
-    # VWAP & Risk (up to 4)
     if s["vwap_ok"]: score += 1
     if s["rr"] >= 2.0: score += 2
     if s["sl_dist"] > 0: score += 1
@@ -464,7 +460,7 @@ async def get_all_coins():
     return final
 
 # =========================================================
-# SCAN — Collects TOP 5 signals with star ratings
+# SCAN WITH PROGRESS
 # =========================================================
 async def run_scan(symbols, update_msg, label, top_n=5):
     start = time.time()
@@ -475,7 +471,7 @@ async def run_scan(symbols, update_msg, label, top_n=5):
         elapsed = int(time.time() - start)
         remaining = int((elapsed / i) * (total - i)) if i > 0 else 0
 
-        if i % 2 == 0:
+        if i % 2 == 0 and update_msg is not None:
             pct = i * 10 // max(total, 1)
             bar = "█" * pct + "░" * (10 - pct)
             found_txt = f"Found: {len(signals)} signals" if signals else "Found: scanning..."
@@ -500,7 +496,7 @@ async def run_scan(symbols, update_msg, label, top_n=5):
     return signals[:top_n], int(time.time() - start)
 
 # =========================================================
-# MESSAGE FORMAT — Multiple signals with stars
+# MESSAGE FORMAT
 # =========================================================
 def fmt_signal_block(s, idx):
     emoji = "🟢" if s["side"] == "LONG" else "🔴"
@@ -550,7 +546,8 @@ def main_menu():
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 <b>Futures Signal Bot</b>\n\nChoose an option:",
+        "🤖 <b>Futures Signal Bot</b>\n\nChoose an option:\n\n"
+        f"<i>Auto-scan runs every {AUTO_SCAN_MINUTES} minutes.</i>",
         reply_markup=main_menu(), parse_mode="HTML"
     )
 
@@ -632,6 +629,29 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"⚠️ Error: {str(e)[:100]}", reply_markup=main_menu())
 
 # =========================================================
+# AUTO SCAN LOOP (every 30 min)
+# =========================================================
+async def auto_scan_loop(bot):
+    await asyncio.sleep(60)  # startup delay
+    while True:
+        try:
+            syms = await get_all_coins()
+            print(f"[AUTO] Scanning {len(syms)} coins...")
+            signals, dur = await run_scan(syms, None, "Auto Scan", top_n=5)
+            if signals:
+                text = fmt_multi_signals(signals, "Auto Scan", len(syms), dur)
+                try:
+                    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="HTML")
+                    print(f"[AUTO] Sent {len(signals)} signals")
+                except Exception as e:
+                    print(f"[AUTO] Send error: {e}")
+            else:
+                print("[AUTO] No signals this cycle")
+        except Exception as e:
+            print(f"[AUTO] Error: {e}")
+        await asyncio.sleep(AUTO_SCAN_MINUTES * 60)
+
+# =========================================================
 # ANTI-SLEEP WEB SERVER
 # =========================================================
 async def health(request):
@@ -657,12 +677,14 @@ async def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     await start_web_server()
-    print("🤖 Bot started (Bybit data)")
+    print(f"🤖 Bot started (Bybit) — auto scan every {AUTO_SCAN_MINUTES} min")
 
     try:
         await app.bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
-            text="🤖 <b>Bot is LIVE (Bybit)</b>\n\nSend /start",
+            text=f"🤖 <b>Bot is LIVE (Bybit)</b>\n\n"
+                 f"Auto-scan every {AUTO_SCAN_MINUTES} min\n"
+                 f"Send /start for menu",
             parse_mode="HTML")
     except Exception as e:
         print(f"Startup msg error: {e}")
@@ -670,6 +692,8 @@ async def main():
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
+
+    asyncio.create_task(auto_scan_loop(app.bot))
 
     while True:
         await asyncio.sleep(3600)
