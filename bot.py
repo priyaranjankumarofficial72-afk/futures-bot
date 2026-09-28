@@ -1,18 +1,16 @@
 # =========================================================
-# FUTURES SIGNAL BOT — Bybit Data (30 Factors + 15 Patterns)
-# Interactive Menu + Auto Scan every 30 min
+# FUTURES SIGNAL BOT — Bybit (30 Factors + 15 Patterns)
+# Auto-scan every 45 min | 100 coins/cycle | 24/7
 # =========================================================
 
 import asyncio
-import csv
 import os
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 import aiohttp
-import requests
 from aiohttp import web
 from pybit.unified_trading import HTTP
 from ta.momentum import RSIIndicator
@@ -31,7 +29,8 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 MIN_VOLUME_USD = 10_000_000
 MIN_SCORE = 20
 PORT = int(os.environ.get("PORT", 10000))
-AUTO_SCAN_MINUTES = 30
+AUTO_SCAN_MINUTES = 45
+SCAN_BATCH_SIZE = 100
 
 bybit = HTTP(testnet=False)
 
@@ -46,14 +45,14 @@ def is_bull(c): return c["close"] > c["open"]
 def is_bear(c): return c["close"] < c["open"]
 def mid(c): return (c["open"] + c["close"]) / 2
 
-# =========================================================
-# BYBIT DATA FETCH
-# =========================================================
 INTERVAL_MAP = {
     "5m": "5", "15m": "15", "30m": "30",
     "1h": "60", "4h": "240", "1d": "D",
 }
 
+# =========================================================
+# BYBIT DATA FETCH
+# =========================================================
 async def fetch_klines(symbol, interval, limit=250):
     try:
         loop = asyncio.get_event_loop()
@@ -409,15 +408,27 @@ async def analyze_symbol(symbol):
 
     return None
     # =========================================================
-# SCANNER
+# SCANNER — ALL Bybit coins
 # =========================================================
-async def get_top10():
+async def get_all_bybit_coins():
     tickers = await fetch_ticker()
     if not tickers:
         return []
-    perps = [t for t in tickers if t["symbol"].endswith("USDT")]
-    perps.sort(key=lambda x: float(x.get("turnover24h", 0)), reverse=True)
-    return [t["symbol"] for t in perps[:10]]
+    perps = []
+    for t in tickers:
+        s = t["symbol"]
+        if not s.endswith("USDT"): continue
+        try:
+            vol = float(t.get("turnover24h", 0))
+            if vol >= MIN_VOLUME_USD:
+                perps.append({"symbol": s, "volume": vol})
+        except: continue
+    perps.sort(key=lambda x: x["volume"], reverse=True)
+    return [p["symbol"] for p in perps]
+
+async def get_top10():
+    coins = await get_all_bybit_coins()
+    return coins[:10]
 
 async def get_gainers(n=20):
     tickers = await fetch_ticker()
@@ -449,16 +460,6 @@ async def get_losers(n=20):
     clean.sort(key=lambda x: x["pct"])
     return [c["symbol"] for c in clean[:n]]
 
-async def get_all_coins():
-    top = await get_top10()
-    gain = await get_gainers(20)
-    lose = await get_losers(20)
-    seen = set(); final = []
-    for s in top + gain + lose:
-        if s not in seen:
-            seen.add(s); final.append(s)
-    return final
-
 # =========================================================
 # SCAN WITH PROGRESS
 # =========================================================
@@ -471,10 +472,10 @@ async def run_scan(symbols, update_msg, label, top_n=5):
         elapsed = int(time.time() - start)
         remaining = int((elapsed / i) * (total - i)) if i > 0 else 0
 
-        if i % 2 == 0 and update_msg is not None:
+        if i % 5 == 0 and update_msg is not None:
             pct = i * 10 // max(total, 1)
             bar = "█" * pct + "░" * (10 - pct)
-            found_txt = f"Found: {len(signals)} signals" if signals else "Found: scanning..."
+            found_txt = f"Found: {len(signals)}" if signals else "Found: scanning..."
             txt = (
                 f"🎯 <b>{label}</b>\n\n"
                 f"Progress: [{bar}] {i}/{total}\n"
@@ -490,7 +491,7 @@ async def run_scan(symbols, update_msg, label, top_n=5):
         result = await analyze_symbol(sym)
         if result and result.get("score", 0) >= MIN_SCORE:
             signals.append(result)
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.2)
 
     signals.sort(key=lambda x: x["score"], reverse=True)
     return signals[:top_n], int(time.time() - start)
@@ -515,13 +516,7 @@ def fmt_signal_block(s, idx):
 
 def fmt_multi_signals(signals, label, scanned, duration):
     if not signals:
-        return (
-            f"🎯 <b>{label} Complete</b>\n\n"
-            f"Scanned: {scanned} coins\n"
-            f"Duration: {duration}s\n\n"
-            f"❌ No setups above min score {MIN_SCORE}"
-        )
-
+        return None
     header = (
         f"🎯 <b>{label} — Top {len(signals)} Signals</b>\n"
         f"Scanned: {scanned} coins | {duration}s\n"
@@ -535,8 +530,8 @@ def fmt_multi_signals(signals, label, scanned, duration):
 # =========================================================
 def main_menu():
     kb = [
-        [InlineKeyboardButton("⚡ Quick (5)", callback_data="quick"),
-         InlineKeyboardButton("🎯 Deep (50)", callback_data="deep")],
+        [InlineKeyboardButton("⚡ Quick (10)", callback_data="quick"),
+         InlineKeyboardButton("🎯 Deep (100)", callback_data="deep")],
         [InlineKeyboardButton("📊 Top 10", callback_data="top10"),
          InlineKeyboardButton("📈 Gainers", callback_data="gainers")],
         [InlineKeyboardButton("📉 Losers", callback_data="losers"),
@@ -546,8 +541,9 @@ def main_menu():
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 <b>Futures Signal Bot</b>\n\nChoose an option:\n\n"
-        f"<i>Auto-scan runs every {AUTO_SCAN_MINUTES} minutes.</i>",
+        f"🤖 <b>Futures Signal Bot</b>\n\n"
+        f"Choose an option:\n\n"
+        f"<i>Auto-scan runs every {AUTO_SCAN_MINUTES} min — 100 coins/cycle.</i>",
         reply_markup=main_menu(), parse_mode="HTML"
     )
 
@@ -560,43 +556,48 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if data == "quick":
             await q.edit_message_text("⚡ Quick scan starting...")
-            syms = (await get_top10())[:5]
+            syms = (await get_all_bybit_coins())[:10]
             signals, dur = await run_scan(syms, msg, "Quick Scan", top_n=5)
-            await q.edit_message_text(
-                fmt_multi_signals(signals, "Quick Scan", len(syms), dur),
-                parse_mode="HTML", reply_markup=main_menu())
+            text = fmt_multi_signals(signals, "Quick Scan", len(syms), dur)
+            if text is None:
+                text = f"😔 Sorry, no setup confirmed.\n\nScanned: {len(syms)} coins"
+            await q.edit_message_text(text, parse_mode="HTML", reply_markup=main_menu())
 
         elif data == "deep":
-            await q.edit_message_text("🎯 Deep analysis starting...")
-            syms = await get_all_coins()
+            await q.edit_message_text("🎯 Deep analysis (100 coins)...")
+            syms = (await get_all_bybit_coins())[:100]
             signals, dur = await run_scan(syms, msg, "Deep Analysis", top_n=5)
-            await q.edit_message_text(
-                fmt_multi_signals(signals, "Deep Analysis", len(syms), dur),
-                parse_mode="HTML", reply_markup=main_menu())
+            text = fmt_multi_signals(signals, "Deep Analysis", len(syms), dur)
+            if text is None:
+                text = f"😔 Sorry, no setup confirmed.\n\nScanned: {len(syms)} coins"
+            await q.edit_message_text(text, parse_mode="HTML", reply_markup=main_menu())
 
         elif data == "top10":
             await q.edit_message_text("📊 Scanning Top 10...")
             syms = await get_top10()
             signals, dur = await run_scan(syms, msg, "Top 10", top_n=5)
-            await q.edit_message_text(
-                fmt_multi_signals(signals, "Top 10", len(syms), dur),
-                parse_mode="HTML", reply_markup=main_menu())
+            text = fmt_multi_signals(signals, "Top 10", len(syms), dur)
+            if text is None:
+                text = f"😔 Sorry, no setup confirmed.\n\nScanned: {len(syms)} coins"
+            await q.edit_message_text(text, parse_mode="HTML", reply_markup=main_menu())
 
         elif data == "gainers":
             await q.edit_message_text("📈 Scanning Gainers...")
             syms = await get_gainers(20)
             signals, dur = await run_scan(syms, msg, "Gainers", top_n=5)
-            await q.edit_message_text(
-                fmt_multi_signals(signals, "Gainers", len(syms), dur),
-                parse_mode="HTML", reply_markup=main_menu())
+            text = fmt_multi_signals(signals, "Gainers", len(syms), dur)
+            if text is None:
+                text = f"😔 Sorry, no setup confirmed.\n\nScanned: {len(syms)} coins"
+            await q.edit_message_text(text, parse_mode="HTML", reply_markup=main_menu())
 
         elif data == "losers":
             await q.edit_message_text("📉 Scanning Losers...")
             syms = await get_losers(20)
             signals, dur = await run_scan(syms, msg, "Losers", top_n=5)
-            await q.edit_message_text(
-                fmt_multi_signals(signals, "Losers", len(syms), dur),
-                parse_mode="HTML", reply_markup=main_menu())
+            text = fmt_multi_signals(signals, "Losers", len(syms), dur)
+            if text is None:
+                text = f"😔 Sorry, no setup confirmed.\n\nScanned: {len(syms)} coins"
+            await q.edit_message_text(text, parse_mode="HTML", reply_markup=main_menu())
 
         elif data == "single":
             await q.edit_message_text(
@@ -623,32 +624,72 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             score = result["score"] if result else 0
             await msg.edit_text(
-                f"🔍 <b>{sym}</b>\n\nScore: {score}/30\n❌ Below min score {MIN_SCORE}",
+                f"🔍 <b>{sym}</b>\n\nScore: {score}/30\n😔 No setup confirmed",
                 parse_mode="HTML", reply_markup=main_menu())
     except Exception as e:
         await msg.edit_text(f"⚠️ Error: {str(e)[:100]}", reply_markup=main_menu())
 
 # =========================================================
-# AUTO SCAN LOOP (every 30 min)
+# AUTO SCAN — every 45 min, 100 coins per cycle
 # =========================================================
 async def auto_scan_loop(bot):
-    await asyncio.sleep(60)  # startup delay
+    await asyncio.sleep(60)
+    cycle = 0
+    sent_cache = set()
+
     while True:
         try:
-            syms = await get_all_coins()
-            print(f"[AUTO] Scanning {len(syms)} coins...")
-            signals, dur = await run_scan(syms, None, "Auto Scan", top_n=5)
-            if signals:
-                text = fmt_multi_signals(signals, "Auto Scan", len(syms), dur)
+            all_coins = await get_all_bybit_coins()
+            total = len(all_coins)
+            if total == 0:
+                print("[AUTO] No coins fetched")
+                await asyncio.sleep(AUTO_SCAN_MINUTES * 60)
+                continue
+
+            num_batches = max(1, (total + SCAN_BATCH_SIZE - 1) // SCAN_BATCH_SIZE)
+            batch_idx = cycle % num_batches
+            start = batch_idx * SCAN_BATCH_SIZE
+            batch = all_coins[start:start + SCAN_BATCH_SIZE]
+
+            print(f"[AUTO] Cycle {cycle+1} | Batch {batch_idx+1}/{num_batches} | Scanning {len(batch)} of {total}")
+
+            signals, dur = await run_scan(batch, None, "Auto Scan", top_n=5)
+
+            new_signals = []
+            for sig in signals:
+                key = f"{sig['symbol']}_{sig['side']}_{round(sig['entry'], 2)}"
+                if key not in sent_cache:
+                    sent_cache.add(key)
+                    new_signals.append(sig)
+
+            if len(sent_cache) > 2000:
+                sent_cache.clear()
+
+            if new_signals:
+                text = fmt_multi_signals(
+                    new_signals,
+                    f"Auto Scan (Batch {batch_idx+1}/{num_batches})",
+                    len(batch), dur
+                )
                 try:
                     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="HTML")
-                    print(f"[AUTO] Sent {len(signals)} signals")
+                    print(f"[AUTO] Sent {len(new_signals)} new signals")
                 except Exception as e:
                     print(f"[AUTO] Send error: {e}")
             else:
-                print("[AUTO] No signals this cycle")
+                await bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text=f"😔 Sorry, no setup confirmed.\n\n"
+                         f"Scanned: {len(batch)}/{total} coins (Batch {batch_idx+1}/{num_batches})\n"
+                         f"Next scan: in {AUTO_SCAN_MINUTES} min",
+                    parse_mode="HTML")
+                print("[AUTO] No new signals")
+
+            cycle += 1
+
         except Exception as e:
             print(f"[AUTO] Error: {e}")
+
         await asyncio.sleep(AUTO_SCAN_MINUTES * 60)
 
 # =========================================================
@@ -677,13 +718,14 @@ async def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     await start_web_server()
-    print(f"🤖 Bot started (Bybit) — auto scan every {AUTO_SCAN_MINUTES} min")
+    print(f"🤖 Bot started — auto scan every {AUTO_SCAN_MINUTES} min")
 
     try:
         await app.bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
             text=f"🤖 <b>Bot is LIVE (Bybit)</b>\n\n"
-                 f"Auto-scan every {AUTO_SCAN_MINUTES} min\n"
+                 f"Auto-scan: every {AUTO_SCAN_MINUTES} min\n"
+                 f"Coins per cycle: {SCAN_BATCH_SIZE}\n"
                  f"Send /start for menu",
             parse_mode="HTML")
     except Exception as e:
