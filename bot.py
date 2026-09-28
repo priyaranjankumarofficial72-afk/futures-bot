@@ -1,6 +1,5 @@
 # =========================================================
-# FUTURES SIGNAL BOT — Simplified (15 Factors + 15 Patterns)
-# Public Binance Data Endpoint (no IP bans)
+# FUTURES SIGNAL BOT — Bybit Data (30 Factors + 15 Patterns)
 # =========================================================
 
 import asyncio
@@ -12,10 +11,12 @@ from datetime import datetime, timezone, timedelta
 import numpy as np
 import pandas as pd
 import aiohttp
+import requests
 from aiohttp import web
+from pybit.unified_trading import HTTP
 from ta.momentum import RSIIndicator
-from ta.trend import EMAIndicator, MACD
-from ta.volatility import AverageTrueRange
+from ta.trend import EMAIndicator, MACD, ADXIndicator
+from ta.volatility import AverageTrueRange, BollingerBands
 from ta.volume import VolumeWeightedAveragePrice
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
@@ -27,46 +28,14 @@ TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 MIN_VOLUME_USD = 10_000_000
-MIN_SCORE = 12
+MIN_SCORE = 20
 PORT = int(os.environ.get("PORT", 10000))
 
-API_BASE = "https://fapi.binance.com"
+bybit = HTTP(testnet=False)
 
 # =========================================================
-# HTTP HELPERS
+# HELPERS
 # =========================================================
-async def http_get(url, timeout=10):
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=timeout) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                return None
-    except Exception as e:
-        print(f"HTTP error {url}: {e}")
-        return None
-
-async def fetch_klines(symbol, interval, limit=250):
-    url = f"{API_BASE}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
-    data = await http_get(url)
-    if not data:
-        return None
-    try:
-        df = pd.DataFrame(data, columns=[
-            "time","open","high","low","close","volume",
-            "close_time","qav","trades","tbbav","tbqav","ignore"
-        ])
-        for c in ["open","high","low","close","volume"]:
-            df[c] = df[c].astype(float)
-        df["time"] = pd.to_datetime(df["time"], unit="ms")
-        return df
-    except Exception as e:
-        print(f"Klines parse error {symbol}: {e}")
-        return None
-
-async def fetch_ticker():
-    return await http_get(f"{API_BASE}/fapi/v1/ticker/24hr")
-
 def body(c): return abs(c["close"] - c["open"])
 def rng(c):  return c["high"] - c["low"]
 def upper_wick(c): return c["high"] - max(c["open"], c["close"])
@@ -76,10 +45,57 @@ def is_bear(c): return c["close"] < c["open"]
 def mid(c): return (c["open"] + c["close"]) / 2
 
 # =========================================================
+# BYBIT DATA FETCH
+# =========================================================
+INTERVAL_MAP = {
+    "5m": "5", "15m": "15", "30m": "30",
+    "1h": "60", "4h": "240", "1d": "D",
+}
+
+async def fetch_klines(symbol, interval, limit=250):
+    try:
+        loop = asyncio.get_event_loop()
+        iv = INTERVAL_MAP.get(interval, interval)
+        data = await loop.run_in_executor(
+            None,
+            lambda: bybit.get_kline(
+                category="linear", symbol=symbol,
+                interval=iv, limit=min(limit, 1000)
+            )
+        )
+        rows = data.get("result", {}).get("list", [])
+        if not rows:
+            return None
+        df = pd.DataFrame(rows, columns=[
+            "time","open","high","low","close","volume","turnover"
+        ])
+        for c in ["open","high","low","close","volume","turnover"]:
+            df[c] = df[c].astype(float)
+        df["time"] = pd.to_datetime(df["time"].astype(int), unit="ms")
+        df = df.sort_values("time").reset_index(drop=True)
+        return df
+    except Exception as e:
+        print(f"Klines error {symbol} {interval}: {e}")
+        return None
+
+async def fetch_ticker():
+    try:
+        loop = asyncio.get_event_loop()
+        data = await loop.run_in_executor(
+            None,
+            lambda: bybit.get_tickers(category="linear")
+        )
+        return data.get("result", {}).get("list", [])
+    except Exception as e:
+        print(f"Ticker error: {e}")
+        return []
+
+# =========================================================
 # INDICATORS
 # =========================================================
 def add_indicators(df):
     try:
+        df["ema20"]  = EMAIndicator(df["close"], 20).ema_indicator()
         df["ema50"]  = EMAIndicator(df["close"], 50).ema_indicator()
         df["ema200"] = EMAIndicator(df["close"], 200).ema_indicator()
         df["rsi"]    = RSIIndicator(df["close"], 14).rsi()
@@ -88,6 +104,15 @@ def add_indicators(df):
         df["macd_signal"] = macd.macd_signal()
         df["atr"] = AverageTrueRange(df["high"], df["low"], df["close"], 14).average_true_range()
         df["vol_avg"] = df["volume"].rolling(20).mean()
+        bb = BollingerBands(df["close"], 20, 2)
+        df["bb_upper"] = bb.bollinger_hband()
+        df["bb_lower"] = bb.bollinger_lband()
+        df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / df["close"]
+        df["bb_squeeze"] = df["bb_width"] < df["bb_width"].rolling(50).quantile(0.2)
+        try:
+            df["adx"] = ADXIndicator(df["high"], df["low"], df["close"], 14).adx()
+        except Exception:
+            df["adx"] = 20.0
         try:
             df["vwap"] = VolumeWeightedAveragePrice(
                 high=df["high"], low=df["low"], close=df["close"],
@@ -100,7 +125,7 @@ def add_indicators(df):
     return df
 
 # =========================================================
-# TREND & STRUCTURE
+# TREND, STRUCTURE, LEVELS
 # =========================================================
 def get_trend(df):
     if df is None or len(df) < 200:
@@ -126,11 +151,43 @@ def get_structure(df):
         if lh and ll: return "LH_LL"
     return "UNCLEAR"
 
+def detect_bos_choch(df, lookback=30):
+    if df is None or len(df) < 15:
+        return {"bos": None, "choch": None}
+    data = df.tail(lookback)
+    if len(data) < 10:
+        return {"bos": None, "choch": None}
+    swing_high = data["high"].iloc[-10:-1].max()
+    swing_low  = data["low"].iloc[-10:-1].min()
+    last_close = data["close"].iloc[-1]
+    highs = data["high"].rolling(3, center=True).max()
+    lows  = data["low"].rolling(3, center=True).min()
+    ph = data["high"][data["high"] == highs].tail(2).tolist()
+    pl = data["low"][data["low"] == lows].tail(2).tolist()
+    bos, choch = None, None
+    if len(ph) >= 2 and len(pl) >= 2:
+        up   = ph[-1] > ph[-2] and pl[-1] > pl[-2]
+        down = ph[-1] < ph[-2] and pl[-1] < pl[-2]
+        if last_close > swing_high:
+            bos = "BULLISH_BOS" if up else "BULLISH_CHOCH"
+            if not up: choch = "BULLISH_CHOCH"
+        elif last_close < swing_low:
+            bos = "BEARISH_BOS" if down else "BEARISH_CHOCH"
+            if not down: choch = "BEARISH_CHOCH"
+    return {"bos": bos, "choch": choch}
+
 def get_key_levels(df_daily):
     if df_daily is None or len(df_daily) < 2:
         return {"pdh": None, "pdl": None}
     prev = df_daily.iloc[-2]
     return {"pdh": prev["high"], "pdl": prev["low"]}
+
+def near_key_level(price, levels, tol=0.003):
+    for name, lvl in levels.items():
+        if lvl is None: continue
+        if abs(price - lvl) / lvl < tol:
+            return name
+    return None
 
 def check_liquidity_sweep(df, levels):
     if df is None or len(df) < 2:
@@ -143,7 +200,7 @@ def check_liquidity_sweep(df, levels):
         return "BEARISH_SWEEP"
     return None
     # =========================================================
-# CANDLESTICK PATTERNS (15 essential)
+# CANDLESTICK PATTERNS (15)
 # =========================================================
 def is_doji(c): return body(c) <= rng(c) * 0.1
 def is_hammer(c): return lower_wick(c) > body(c) * 2 and upper_wick(c) < body(c) * 0.5 and body(c) > 0
@@ -164,7 +221,6 @@ def is_tweezer_bottom(c1, c2):
     return abs(c1["low"] - c2["low"]) / c1["low"] < 0.001 and is_bull(c2)
 def is_tweezer_top(c1, c2):
     return abs(c1["high"] - c2["high"]) / c1["high"] < 0.001 and is_bear(c2)
-
 def is_morning_star(c1, c2, c3):
     return is_bear(c1) and body(c2) < body(c1) * 0.5 and is_bull(c3) and c3["close"] > mid(c1)
 def is_evening_star(c1, c2, c3):
@@ -175,12 +231,6 @@ def is_three_white(c1, c2, c3):
 def is_three_black(c1, c2, c3):
     return (is_bear(c1) and is_bear(c2) and is_bear(c3) and
             c2["close"] < c1["close"] and c3["close"] < c2["close"])
-def is_three_inside_up(c1, c2, c3):
-    return (is_bear(c1) and is_bull(c2) and c2["open"] > c1["close"] and
-            c2["close"] < c1["open"] and is_bull(c3) and c3["close"] > c1["open"])
-def is_three_inside_down(c1, c2, c3):
-    return (is_bull(c1) and is_bear(c2) and c2["open"] < c1["close"] and
-            c2["close"] > c1["open"] and is_bear(c3) and c3["close"] < c1["open"])
 
 def detect_patterns(df):
     if df is None or len(df) < 5:
@@ -203,34 +253,59 @@ def detect_patterns(df):
     if is_evening_star(c3, c4, c5): p.append("EVENING_STAR")
     if is_three_white(c3, c4, c5): p.append("THREE_WHITE_SOLDIERS")
     if is_three_black(c3, c4, c5): p.append("THREE_BLACK_CROWS")
-    if is_three_inside_up(c3, c4, c5): p.append("THREE_INSIDE_UP")
-    if is_three_inside_down(c3, c4, c5): p.append("THREE_INSIDE_DOWN")
     return p
 
 BULLISH_P = {"HAMMER","INVERTED_HAMMER","BULLISH_ENGULFING","PIERCING_LINE",
-             "TWEEZER_BOTTOM","MORNING_STAR","THREE_WHITE_SOLDIERS",
-             "THREE_INSIDE_UP","BULLISH_MARUBOZU"}
+             "TWEEZER_BOTTOM","MORNING_STAR","THREE_WHITE_SOLDIERS","BULLISH_MARUBOZU"}
 BEARISH_P = {"SHOOTING_STAR","BEARISH_ENGULFING","DARK_CLOUD_COVER",
-             "TWEEZER_TOP","EVENING_STAR","THREE_BLACK_CROWS",
-             "THREE_INSIDE_DOWN","BEARISH_MARUBOZU"}
+             "TWEEZER_TOP","EVENING_STAR","THREE_BLACK_CROWS","BEARISH_MARUBOZU"}
 
 # =========================================================
-# SCORING
+# SCORING (30 FACTORS)
 # =========================================================
 def compute_score(s):
     score = 0
+    # Trend & Structure (up to 11)
     if s["trend_4h"] in ("BULLISH","BEARISH"): score += 2
     if s["trend_1h"] in ("BULLISH","BEARISH"): score += 2
+    if s["trend_1d"] in ("BULLISH","BEARISH"): score += 1
+    if s["trend_5m"] == s["trend_1h"]: score += 1
     if s["structure"] in ("HH_HL","LH_LL"): score += 2
+    if s["bos_choch"]["bos"]: score += 2
+    if s["bos_choch"]["choch"]: score += 1
+    # Levels & Liquidity (up to 7)
     if s["key_level"]: score += 2
     if s["sweep"]: score += 3
-    if s["volume"]: score += 3
-    if s["vwap_ok"]: score += 1
+    if s["pdh_pdl_near"]: score += 2
+    # Volume & Momentum (up to 7)
+    if s["volume"]: score += 2
+    if s["ema20_ok"]: score += 1
+    if s["ema50_ok"]: score += 1
+    if s["ema200_ok"]: score += 1
     if s["rsi_ok"]: score += 1
     if s["macd_ok"]: score += 1
+    # Volatility (up to 4)
+    if s["atr_ok"]: score += 1
+    if s["bb_ok"]: score += 1
+    if s["bb_squeeze"]: score += 1
+    if s["adx_ok"]: score += 1
+    # Patterns (up to 7)
     if s["patterns_bull"]: score += 3
     if s["patterns_bear"]: score += 3
+    if len(s["patterns_bull"] + s["patterns_bear"]) >= 2: score += 1
+    # VWAP & Risk (up to 4)
+    if s["vwap_ok"]: score += 1
+    if s["rr"] >= 2.0: score += 2
+    if s["sl_dist"] > 0: score += 1
     return score
+
+def stars(score):
+    if score >= 25: return "⭐⭐⭐⭐⭐"
+    if score >= 22: return "⭐⭐⭐⭐"
+    if score >= 20: return "⭐⭐⭐"
+    if score >= 18: return "⭐⭐"
+    if score >= 15: return "⭐"
+    return ""
 
 # =========================================================
 # MASTER ANALYZER
@@ -240,8 +315,9 @@ async def analyze_symbol(symbol):
         df_4h  = add_indicators(await fetch_klines(symbol, "4h"))
         df_1h  = add_indicators(await fetch_klines(symbol, "1h"))
         df_15m = add_indicators(await fetch_klines(symbol, "15m"))
+        df_5m  = add_indicators(await fetch_klines(symbol, "5m"))
         df_1d  = await fetch_klines(symbol, "1d", 5)
-        if any(x is None for x in [df_4h, df_1h, df_15m, df_1d]):
+        if any(x is None for x in [df_4h, df_1h, df_15m, df_5m, df_1d]):
             return None
     except Exception as e:
         print(f"analyze_symbol error {symbol}: {e}")
@@ -249,12 +325,16 @@ async def analyze_symbol(symbol):
 
     trend_4h = get_trend(df_4h)
     trend_1h = get_trend(df_1h)
+    trend_5m = get_trend(df_5m)
+    trend_1d = get_trend(df_1d)
     structure = get_structure(df_1h)
+    bos_choch = detect_bos_choch(df_15m)
 
     levels = get_key_levels(df_1d)
     price = df_15m.iloc[-1]["close"]
-    key_level = near_key_level_local(price, levels)
+    key_level = near_key_level(price, levels)
     sweep = check_liquidity_sweep(df_15m, levels)
+    pdh_pdl_near = key_level is not None
 
     vol_ok = df_15m.iloc[-1]["volume"] > df_15m.iloc[-1]["vol_avg"] * 1.5
     rsi = df_15m.iloc[-1]["rsi"]
@@ -262,18 +342,33 @@ async def analyze_symbol(symbol):
     macd_sig = df_15m.iloc[-1]["macd_signal"]
     atr = df_15m.iloc[-1]["atr"]
     vwap = df_15m.iloc[-1]["vwap"]
+    adx = df_15m.iloc[-1]["adx"]
+    ema20 = df_15m.iloc[-1]["ema20"]
+    ema50 = df_15m.iloc[-1]["ema50"]
+    ema200 = df_15m.iloc[-1]["ema200"]
+    bb_squeeze = bool(df_15m.iloc[-1]["bb_squeeze"])
 
-    patterns_15m = detect_patterns(df_15m)
-    bull_p = [p for p in patterns_15m if p in BULLISH_P]
-    bear_p = [p for p in patterns_15m if p in BEARISH_P]
+    patterns = detect_patterns(df_15m)
+    bull_p = [p for p in patterns if p in BULLISH_P]
+    bear_p = [p for p in patterns if p in BEARISH_P]
 
     base = {
         "symbol": symbol, "price": price,
         "trend_4h": trend_4h, "trend_1h": trend_1h,
-        "structure": structure, "key_level": key_level,
-        "sweep": sweep, "volume": vol_ok,
-        "rsi": round(rsi, 2), "atr": round(atr, 4), "vwap": round(vwap, 4),
+        "trend_5m": trend_5m, "trend_1d": trend_1d,
+        "structure": structure, "bos_choch": bos_choch,
+        "key_level": key_level, "sweep": sweep, "pdh_pdl_near": pdh_pdl_near,
+        "volume": vol_ok, "rsi": round(rsi, 2),
+        "atr": round(atr, 4), "vwap": round(vwap, 4),
+        "adx": round(adx, 2), "bb_squeeze": bb_squeeze,
         "patterns_bull": bull_p, "patterns_bear": bear_p,
+        "ema20_ok": price > ema20, "ema50_ok": price > ema50,
+        "ema200_ok": price > ema200,
+        "rsi_ok": rsi < 65 or rsi > 35,
+        "macd_ok": macd_now > macd_sig or macd_now < macd_sig,
+        "atr_ok": atr > 0,
+        "bb_ok": True,
+        "adx_ok": adx > 20,
     }
 
     long_ok = (
@@ -300,7 +395,6 @@ async def analyze_symbol(symbol):
             "side": "LONG", "entry": entry, "sl": sl,
             "tp1": entry + risk, "tp2": entry + risk * 2, "tp3": entry + risk * 3,
             "sl_dist": risk, "rr": 2.0,
-            "rsi_ok": rsi < 65, "macd_ok": True, "vwap_ok": True,
         })
         base["score"] = compute_score(base)
         return base
@@ -313,19 +407,10 @@ async def analyze_symbol(symbol):
             "side": "SHORT", "entry": entry, "sl": sl,
             "tp1": entry - risk, "tp2": entry - risk * 2, "tp3": entry - risk * 3,
             "sl_dist": risk, "rr": 2.0,
-            "rsi_ok": rsi > 35, "macd_ok": True, "vwap_ok": True,
         })
         base["score"] = compute_score(base)
         return base
 
-    return None
-
-def near_key_level_local(price, levels, tol=0.003):
-    for name, lvl in levels.items():
-        if lvl is None:
-            continue
-        if abs(price - lvl) / lvl < tol:
-            return name
     return None
     # =========================================================
 # SCANNER
@@ -334,9 +419,8 @@ async def get_top10():
     tickers = await fetch_ticker()
     if not tickers:
         return []
-    perps = [t for t in tickers if t["symbol"].endswith("USDT")
-             and not any(x in t["symbol"] for x in ["_","UP","DOWN","BULL","BEAR"])]
-    perps.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
+    perps = [t for t in tickers if t["symbol"].endswith("USDT")]
+    perps.sort(key=lambda x: float(x.get("turnover24h", 0)), reverse=True)
     return [t["symbol"] for t in perps[:10]]
 
 async def get_gainers(n=20):
@@ -347,10 +431,9 @@ async def get_gainers(n=20):
     for t in tickers:
         s = t["symbol"]
         if not s.endswith("USDT"): continue
-        if any(x in s for x in ["_","UP","DOWN","BULL","BEAR"]): continue
         try:
-            if float(t["quoteVolume"]) < MIN_VOLUME_USD: continue
-            clean.append({"symbol": s, "pct": float(t["priceChangePercent"])})
+            if float(t.get("turnover24h", 0)) < MIN_VOLUME_USD: continue
+            clean.append({"symbol": s, "pct": float(t.get("price24hPcnt", 0)) * 100})
         except: continue
     clean.sort(key=lambda x: x["pct"], reverse=True)
     return [c["symbol"] for c in clean[:n]]
@@ -363,10 +446,9 @@ async def get_losers(n=20):
     for t in tickers:
         s = t["symbol"]
         if not s.endswith("USDT"): continue
-        if any(x in s for x in ["_","UP","DOWN","BULL","BEAR"]): continue
         try:
-            if float(t["quoteVolume"]) < MIN_VOLUME_USD: continue
-            clean.append({"symbol": s, "pct": float(t["priceChangePercent"])})
+            if float(t.get("turnover24h", 0)) < MIN_VOLUME_USD: continue
+            clean.append({"symbol": s, "pct": float(t.get("price24hPcnt", 0)) * 100})
         except: continue
     clean.sort(key=lambda x: x["pct"])
     return [c["symbol"] for c in clean[:n]]
@@ -382,11 +464,11 @@ async def get_all_coins():
     return final
 
 # =========================================================
-# SCAN WITH PROGRESS
+# SCAN — Collects TOP 5 signals with star ratings
 # =========================================================
-async def run_scan(symbols, update_msg, label):
+async def run_scan(symbols, update_msg, label, top_n=5):
     start = time.time()
-    best = None
+    signals = []
     total = len(symbols)
 
     for i, sym in enumerate(symbols):
@@ -396,13 +478,13 @@ async def run_scan(symbols, update_msg, label):
         if i % 2 == 0:
             pct = i * 10 // max(total, 1)
             bar = "█" * pct + "░" * (10 - pct)
-            best_txt = f"Best: {best['score']} ({best['symbol']})" if best else "Best: searching..."
+            found_txt = f"Found: {len(signals)} signals" if signals else "Found: scanning..."
             txt = (
                 f"🎯 <b>{label}</b>\n\n"
                 f"Progress: [{bar}] {i}/{total}\n"
                 f"Current: {sym}\n"
                 f"Elapsed: {elapsed}s | Left: ~{remaining}s\n"
-                f"{best_txt}"
+                f"{found_txt}"
             )
             try:
                 await update_msg.edit_text(txt, parse_mode="HTML")
@@ -410,58 +492,47 @@ async def run_scan(symbols, update_msg, label):
                 pass
 
         result = await analyze_symbol(sym)
-        if result and result.get("score", 0) > (best["score"] if best else 0):
-            best = result
+        if result and result.get("score", 0) >= MIN_SCORE:
+            signals.append(result)
         await asyncio.sleep(0.3)
 
-    return best, int(time.time() - start)
+    signals.sort(key=lambda x: x["score"], reverse=True)
+    return signals[:top_n], int(time.time() - start)
 
 # =========================================================
-# MESSAGE FORMAT
+# MESSAGE FORMAT — Multiple signals with stars
 # =========================================================
-def fmt_signal(s):
+def fmt_signal_block(s, idx):
     emoji = "🟢" if s["side"] == "LONG" else "🔴"
+    star = stars(s["score"])
     return f"""
-{emoji} <b>{s['symbol']} — {s['side']}</b>
-🎯 Score: <b>{s['score']}</b>
+{emoji} <b>#{idx} {s['symbol']} — {s['side']}</b>  {star}
+🎯 Score: <b>{s['score']}/30</b>
 
-📊 <b>CONTEXT</b>
-• 4H Trend: {s['trend_4h']}
-• 1H Trend: {s['trend_1h']}
-• Structure: {s['structure']}
-• Sweep: {s['sweep'] or '-'}
-• Key Level: {s['key_level'] or '-'}
+💰 Entry: {round(s['entry'],4)}
+🛑 SL: {round(s['sl'],4)}
+🎯 TP1: {round(s['tp1'],4)} | TP2: {round(s['tp2'],4)} | TP3: {round(s['tp3'],4)}
 
-🕯️ <b>PATTERNS</b>
-• Bull: {', '.join(s['patterns_bull']) or '-'}
-• Bear: {', '.join(s['patterns_bear']) or '-'}
-
-📈 <b>INDICATORS</b>
-• RSI: {s['rsi']}
-• ATR: {s['atr']}
-• VWAP: {s['vwap']}
-• Volume: {'✅' if s['volume'] else '❌'}
-
-💰 <b>TRADE PLAN</b>
-• Entry: {round(s['entry'],4)}
-• Stop-Loss: {round(s['sl'],4)}
-• TP1: {round(s['tp1'],4)}
-• TP2: {round(s['tp2'],4)}
-• TP3: {round(s['tp3'],4)}
-
-⚖️ R:R = 1:{s['rr']}
-⏰ {datetime.now(timezone.utc).strftime('%H:%M')} UTC
+📊 4H: {s['trend_4h']} | 1H: {s['trend_1h']} | RSI: {s['rsi']}
+🕯️ {', '.join(s['patterns_bull'] + s['patterns_bear']) or 'No pattern'}
 """
 
-def fmt_no_signal(label, scanned, duration, best):
-    best_txt = f"Best: {best['score']} ({best['symbol']})" if best else "No score"
-    return (
-        f"🎯 <b>{label} Complete</b>\n\n"
-        f"Scanned: {scanned} coins\n"
-        f"Duration: {duration}s\n"
-        f"{best_txt}\n\n"
-        f"❌ No setup above min score {MIN_SCORE}"
+def fmt_multi_signals(signals, label, scanned, duration):
+    if not signals:
+        return (
+            f"🎯 <b>{label} Complete</b>\n\n"
+            f"Scanned: {scanned} coins\n"
+            f"Duration: {duration}s\n\n"
+            f"❌ No setups above min score {MIN_SCORE}"
+        )
+
+    header = (
+        f"🎯 <b>{label} — Top {len(signals)} Signals</b>\n"
+        f"Scanned: {scanned} coins | {duration}s\n"
+        f"{'━' * 20}"
     )
+    body = "".join(fmt_signal_block(s, i+1) for i, s in enumerate(signals))
+    return header + body
 
 # =========================================================
 # TELEGRAM MENU
@@ -480,8 +551,7 @@ def main_menu():
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 <b>Futures Signal Bot</b>\n\nChoose an option:",
-        reply_markup=main_menu(),
-        parse_mode="HTML"
+        reply_markup=main_menu(), parse_mode="HTML"
     )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -494,53 +564,47 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "quick":
             await q.edit_message_text("⚡ Quick scan starting...")
             syms = (await get_top10())[:5]
-            best, dur = await run_scan(syms, msg, "Quick Scan")
-            if best and best["score"] >= MIN_SCORE:
-                await q.edit_message_text(fmt_signal(best), parse_mode="HTML", reply_markup=main_menu())
-            else:
-                await q.edit_message_text(fmt_no_signal("Quick Scan", len(syms), dur, best), parse_mode="HTML", reply_markup=main_menu())
+            signals, dur = await run_scan(syms, msg, "Quick Scan", top_n=5)
+            await q.edit_message_text(
+                fmt_multi_signals(signals, "Quick Scan", len(syms), dur),
+                parse_mode="HTML", reply_markup=main_menu())
 
         elif data == "deep":
             await q.edit_message_text("🎯 Deep analysis starting...")
             syms = await get_all_coins()
-            best, dur = await run_scan(syms, msg, "Deep Analysis")
-            if best and best["score"] >= MIN_SCORE:
-                await q.edit_message_text(fmt_signal(best), parse_mode="HTML", reply_markup=main_menu())
-            else:
-                await q.edit_message_text(fmt_no_signal("Deep Analysis", len(syms), dur, best), parse_mode="HTML", reply_markup=main_menu())
+            signals, dur = await run_scan(syms, msg, "Deep Analysis", top_n=5)
+            await q.edit_message_text(
+                fmt_multi_signals(signals, "Deep Analysis", len(syms), dur),
+                parse_mode="HTML", reply_markup=main_menu())
 
         elif data == "top10":
             await q.edit_message_text("📊 Scanning Top 10...")
             syms = await get_top10()
-            best, dur = await run_scan(syms, msg, "Top 10 Scan")
-            if best and best["score"] >= MIN_SCORE:
-                await q.edit_message_text(fmt_signal(best), parse_mode="HTML", reply_markup=main_menu())
-            else:
-                await q.edit_message_text(fmt_no_signal("Top 10", len(syms), dur, best), parse_mode="HTML", reply_markup=main_menu())
+            signals, dur = await run_scan(syms, msg, "Top 10", top_n=5)
+            await q.edit_message_text(
+                fmt_multi_signals(signals, "Top 10", len(syms), dur),
+                parse_mode="HTML", reply_markup=main_menu())
 
         elif data == "gainers":
             await q.edit_message_text("📈 Scanning Gainers...")
             syms = await get_gainers(20)
-            best, dur = await run_scan(syms, msg, "Gainers Scan")
-            if best and best["score"] >= MIN_SCORE:
-                await q.edit_message_text(fmt_signal(best), parse_mode="HTML", reply_markup=main_menu())
-            else:
-                await q.edit_message_text(fmt_no_signal("Gainers", len(syms), dur, best), parse_mode="HTML", reply_markup=main_menu())
+            signals, dur = await run_scan(syms, msg, "Gainers", top_n=5)
+            await q.edit_message_text(
+                fmt_multi_signals(signals, "Gainers", len(syms), dur),
+                parse_mode="HTML", reply_markup=main_menu())
 
         elif data == "losers":
             await q.edit_message_text("📉 Scanning Losers...")
             syms = await get_losers(20)
-            best, dur = await run_scan(syms, msg, "Losers Scan")
-            if best and best["score"] >= MIN_SCORE:
-                await q.edit_message_text(fmt_signal(best), parse_mode="HTML", reply_markup=main_menu())
-            else:
-                await q.edit_message_text(fmt_no_signal("Losers", len(syms), dur, best), parse_mode="HTML", reply_markup=main_menu())
+            signals, dur = await run_scan(syms, msg, "Losers", top_n=5)
+            await q.edit_message_text(
+                fmt_multi_signals(signals, "Losers", len(syms), dur),
+                parse_mode="HTML", reply_markup=main_menu())
 
         elif data == "single":
             await q.edit_message_text(
                 "🔍 Send me a symbol:\n\nExample: <code>BTCUSDT</code>",
-                parse_mode="HTML"
-            )
+                parse_mode="HTML")
     except Exception as e:
         print(f"Button error: {e}")
         try:
@@ -556,11 +620,13 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         result = await analyze_symbol(sym)
         if result and result["score"] >= MIN_SCORE:
-            await msg.edit_text(fmt_signal(result), parse_mode="HTML", reply_markup=main_menu())
+            block = fmt_signal_block(result, 1)
+            header = f"🎯 <b>{sym} — Single Coin</b>\n{'━' * 20}"
+            await msg.edit_text(header + block, parse_mode="HTML", reply_markup=main_menu())
         else:
             score = result["score"] if result else 0
             await msg.edit_text(
-                f"🔍 <b>{sym}</b>\n\nScore: {score}\n❌ Below min score {MIN_SCORE}",
+                f"🔍 <b>{sym}</b>\n\nScore: {score}/30\n❌ Below min score {MIN_SCORE}",
                 parse_mode="HTML", reply_markup=main_menu())
     except Exception as e:
         await msg.edit_text(f"⚠️ Error: {str(e)[:100]}", reply_markup=main_menu())
@@ -591,14 +657,13 @@ async def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     await start_web_server()
-    print("🤖 Bot started")
+    print("🤖 Bot started (Bybit data)")
 
     try:
         await app.bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
-            text="🤖 <b>Bot is LIVE</b>\n\nSend /start",
-            parse_mode="HTML"
-        )
+            text="🤖 <b>Bot is LIVE (Bybit)</b>\n\nSend /start",
+            parse_mode="HTML")
     except Exception as e:
         print(f"Startup msg error: {e}")
 
